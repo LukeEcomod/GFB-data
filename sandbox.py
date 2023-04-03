@@ -11,241 +11,160 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-ffile = r'c:\data\GFB\FI-Var\proc\FI-Var_2013_2022.dat'
-
-def InterpolateShortGaps(dat, N, method='linear', flags=None, gapcode=1):
-    """Filling short gaps within the time series with interpolation.
-    Args:
-        df (pd.Series): data
-        N (int): max length (observations) for the gaps to be filled
-        method (str, optional): method used for interpolation. Default 'linear'
-        flags (pd.Series) - optional
-        gapcode (int) - code for short gaps
-    Returns:
-        out (pd.Series): output data, the short gaps filled with selected interpolation method
-        flag (pd.Series): gap-flags. 0 = observations, gapcode = short gaps
-    """
-    
-    out = dat.copy()
-    
-    if (method!='linear') & (method!='nearest') & (method!='quadratic') & (method!='cubic') & (method!='spline'):
-        msg = 'Unknown method given (%s) for interpolating short gaps. Using ''linear'' instead.'%(method,)
-        print(msg)
-        method = 'linear'
-        
-    dat_interpolated = dat.interpolate(method=method)
-
-    mask = dat.isna()
-    x = (mask.groupby((mask != mask.shift()).cumsum()).transform(lambda x: len(x) > N)*mask)
-    
-    ixn = np.where(~x)[0] # indices that are either observations or match short gap criteria
-    out[ixn] = dat_interpolated[ixn] # ... values copied to output
-    del ixn
-    
-    if not flags:
-        flags = pd.Series(data=np.ones(len(dat))*np.NaN, index=dat.index)
-        # observations
-        ixg = np.where(dat.isna()==False)[0]
-        flags.iloc[ixg] = 0
-    
-    # get filled indices
-    diff = dat.reset_index().compare(out.reset_index())
-
-    ix = diff.index
-    flags.iloc[ix] = gapcode
-    
-    return out, flags
-
-
-def MDC(dat, method='mean', deltat='30min', flags=None):
-    """
-    Gapfilling by mean diurnal course
-    dat, method='mean', deltadays=1, Nmin=1, deltat='30min'
-    
-    Args:
-        dat (pd.Series) - data
-        method (str) - 'mean', 'median'
-    Returns:
-        dout (pd.Series) - gap-filled series
-        flags (pd.Series) - flags for window length
-    """
-    from src.utils import DiurnalPattern
-    
-    Nmin = 2
-    dout = dat.copy()
-    N = len(dat)
-    
-    if flags is None:
-        flags = pd.Series(dat=np.ones(N)*np.NaN, index=dat.index)
-        # observations
-        ixg = np.where(dat.isna()==False)[0]
-        flags.iloc[ixg] = 0
-
-    gaps = True    
-    window = 2
-    
-    while gaps:
-        print(window)
-        fdat = DiurnalPattern(dout, method=method, deltadays=window, Nmin=Nmin, deltat=deltat)
-        ix = np.where(dout.isna())
-        #ix = np.where((dout.isna()==True) & (fdat.isna()==False))[0]
-        
-        dout.iloc[ix] = fdat.iloc[ix]
-        flags.iloc[ix] = window 
-        
-        window += 2
-        
-        # bool
-        gaps = dout.isna().any()
-        print(len(np.where(dout.isna())[0]))
-    
-    return dout, flags
-
-#%% get data
-flx = pd.read_csv(ffile, sep=';', decimal='.')
-t = pd.to_datetime(flx[['Year', 'Month', 'Day', 'Hour', 'Minute']])
-flx.index = t
-
-#%%
-dat = flx.loc[flx.index < '2015-01-01'] 
-
-yin = dat['Tair']
-
-out, flags = InterpolateShortGaps(yin, N=10)
-
-out2, flags = MDC(out, method='median', deltat='30min', flags=flags)
-
-fig, ax = plt.subplots(2,1, sharex=True)
-#ax[0].plot(dint, '.-', label='dint')
-ax[0].plot(out2, '.-', label='MDC')
-ax[0].plot(out, '.-', label='lin')
-ax[0].plot(yin, '.-', label='obs')
-ax[0].legend()
-
-ax[1].plot(flags, '.-')
-
-#%%
-met = flx.copy()
-met.rename(columns={'Precip':'Prec', 'diffPAR':'diffPar', 'Tsoil1':'Tsoil', 'wsoil': 'Wsoil'}, inplace=True)
-met = met[['Rn', 'Rg', 'Par', 'diffPar', 'U', 'u_star', 'Tair', 'RH', 'CO2', 'LWin', 'Prec',
-           'Tsoil', 'Wsoil']]
-
-met['P'] = 101300.0
-met = met[~met.index.duplicated(keep='first')]
-#%%
-from src.utils import create_forcingfile
-
-lat = 67.747
-lon = 29.618
-forc, flags = create_forcingfile(met, 'output_file',lat, lon, met_data=None, timezone=+2.0,
-                                 CO2_constant=False, short_gap_len=5)
-
-#%% K-NN
-from sklearn.metrics import mean_squared_error 
-from sklearn.neighbors import KNeighborsRegressor
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn import metrics
+from sklearn import preprocessing
+
+from src.utils import rf_crossvalidate
 
 
-d_f = met['diffPar'] / (met['Par'] + 1e-8)
-d_f[d_f<0.2] = 0.2
+def clear_sky_radiation(doy, zen):
+    # clear sky Global radiation at surface
+    So = 1367.0
+    Rg0 = np.maximum(0.0, (So * (1.0 + 0.033 * np.cos(2.0 * np.pi * (np.minimum(doy, 365) - 10) / 365)) * np.cos(zen)))
+    
+    return Rg0
 
-d_f[forc['Zen'] <= 0] = 1.0
-d_f[d_f>1.0] = 1.0
+ffile = r'c:\data\GFB\FI-Var\proc\FI-Var_forcing_2013-2022.dat'
 
-ix = np.where((d_f.isna() == False) & (met['Par']>10))[0]
+dat = pd.read_csv(ffile, sep=';')
+t = pd.to_datetime(dat[['Year', 'Month', 'Day', 'Hour', 'Minute']])
+dat.index = t
 
-Y = d_f
-X = forc[['doy', 'Zen', 'Tair', 'H2O', 'U', 'Rg', 'Prec']]
-X['doy'] = X['doy'] + X.index.hour.values / 24 + X.index.hour.values / (24 * 60)
+cols = list(dat.columns)
 
-X = X[['doy', 'Zen', 'Rg']]#, 'H2O']]
+x = dat[['doy', 'Zen', 'Prec', 'P', 'Tair', 'H2O', 'dirPar', 'diffPar']]
+x['Par'] = x['dirPar'] + x['diffPar']
 
-rf = RandomForestRegressor(n_estimators=10)
-rf_fit = rf.fit(X.iloc[ix].values, Y.iloc[ix].values)
+#doy at UTC +2
+decimal_doy = x['doy'].values + x.index.hour.values / 24 + x.index.minute.values / (24*60)
+decimal_doy -= 2.0/24
 
-Y_pred = rf.predict(X.values)
-Y_pred[forc['Zen']<=0] = 1.0
+x['Rg0'] = clear_sky_radiation(decimal_doy, x['Zen'].values)
 
-plt.figure()
-plt.plot(Y.iloc[ix], 'r.-', label='obs')
-#plt.plot(forc['f_d'].iloc[ix], 'g.-', label='mod')
-#plt.plot(X.index, pred_y, '-', label='KNN')
-plt.plot(X.index[ix], Y_pred[ix], '-', label='RF')
-plt.ylabel('diffuse fraction')
-plt.legend()
+# create daily data
 
-plt.figure()
-plt.plot(Y.iloc[ix], Y_pred[ix], 'ro', alpha=0.1)
-plt.ylabel('RF')
-plt.xlabel('obs')
+dave = x.resample('D').mean()
+dave['Prec'] = x['Prec'].resample('D').sum()
 
-#ixp = np.setdiff1d(np.arange(0, len(Y)), ix)
-ixp = np.where((d_f.isna()) & (met['Par']>10))[0]
+dmin = x[['Tair', 'H2O']].resample('D').min()
+dmin.columns = [c + '_min' for c in dmin.columns]
 
-fig, ax = plt.subplots(1,2)
+dmax = x[['Tair', 'H2O']].resample('D').max()
+dmax.columns = [c + '_max' for c in dmax.columns]
 
-ax[0].hist(Y.iloc[ix], bins=20, alpha = 0.5, label='obs')
-ax[0].hist(Y_pred[ix], bins=20, alpha = 0.5, label='RF - train')
-ax[0].set_ylabel('counts')
-ax[0].set_xlabel('diffuse fraction')
-ax[0].legend()
+ddata = pd.concat([dave, dmin, dmax], axis=1)
+ddata = ddata.resample('30min').ffill()
+ddata = ddata.reindex(index=x.index)
+ddata = ddata.fillna(method='ffill')
 
-ax[1].hist(Y.iloc[ix], bins=20, alpha = 0.5, label='obs - train')
-ax[1].hist(Y_pred[ixp], bins=20, alpha = 0.5, label='RF - predict')
-ax[1].set_ylabel('counts')
-ax[1].set_xlabel('diffuse fraction')
-ax[1].legend()
+ddata['Zen'] = x['Zen']
+ddata['Rg0'] = x['Rg0']
+#ddata['Par'] = ddata['dirPar'] + ddata['diffPar']
 
-#%%
-from src.utils import gap_fill_rf
+#%% test
 
-d_f = met['diffPar'] / (met['Par'] + 1e-8)
-d_f[d_f<0.2] = 0.2
+v = ['Tair', 'H2O']
+#v = 'Tair'
 
-d_f[forc['Zen'] <= 0] = 1.0
-d_f[met['Par'] < 10] = 1.0
-d_f[d_f>1.0] = 1.0
+ixt = np.where(x.index.year<2016)[0]
+ixp = np.where(x.index.year>2016)[0]
 
-#ix = np.where((d_f.isna() == False) & (met['Par']>10))[0]
-ix = np.where((d_f.isna() == False))[0]
+#pcols = ['doy', 'Zen', 'Prec', 'P', 'Tair', 'Tair_min', 'Tair_max', 'H2O', 'H2O_min', 'H2O_max']#, 'Par']
+pcols = ['Zen', 'Tair', 'Tair_min', 'Tair_max', 'H2O', 'H2O_min', 'H2O_max'] #, 'Par']
 
-Y = d_f
-X = forc[['doy', 'Zen', 'Tair', 'H2O', 'U', 'Rg', 'Prec']]
-X['doy'] = X['doy'] + X.index.hour.values / 24 + X.index.hour.values / (24 * 60)
+Y = x[v].iloc[ixt].values
+#Y = Y.reshape(-1, 1)
+X = ddata.iloc[ixt].values
+t = x.index[ixt]
 
-X = X[['doy', 'Zen', 'Rg']].values#, 'H2O']]
-X = X.values
-Y = Y.values
+rf, scaler_X, scaler_Y, cv_score, score = rf_crossvalidate(X, Y, test_size=0.3, nfolds=5, n_estimators=10)
 
-Ygf, Ypred = gap_fill_rf(Y, X, ix)
 
-#%% estimate emi_sky and LWin
-#: [W m\ :sup:`-2` K\ :sup:`-4`\ ], Stefan-Boltzmann constant
-STEFAN_BOLTZMANN = 5.6697e-8
+Yp = x[v].iloc[ixp].values
+#Yp = Yp.reshape(-1, 1)
+Xp = ddata.iloc[ixp].values
+tp = x.index[ixp]
 
-LWin = met['LWin']
-Tk = met['Tair'] + 273.15
+# prediction to train set
+Ytpred = scaler_Y.inverse_transform(rf.predict(scaler_X.transform(X)))
+print('score (R2) in train set: %.2f' % rf.score(scaler_X.transform(X), 
+                                               scaler_Y.transform(Y))
+      )
 
-emi_sky = LWin / (STEFAN_BOLTZMANN * Tk**4)
-emi_sky[emi_sky > 1.0] = 1.0
-ix = np.where(emi_sky.isna()==False)
+# prediction to independent test set
+Ypred = scaler_Y.inverse_transform(rf.predict(scaler_X.transform(Xp)))
+print('score (R2) in test set: %.2f' % rf.score(scaler_X.transform(Xp),
+                                              scaler_Y.transform(Yp))
+      )
 
-plt.figure()
-plt.plot(emi_sky, '.-')
-
-Y = emi_sky.values
-X = forc[['doy', 'Zen', 'Tair', 'H2O', 'U', 'Rg', 'Prec']]
-X['doy'] = X['doy'] + X.index.hour.values / 24 + X.index.hour.values / (24 * 60)
-
-X = X[['doy', 'Tair', 'H2O', 'Rg']].values
-
-Ypred = gap_fill_rf(Y, X, ix, figtitle='emi_sky')
-
-LWin_pred = Ypred * STEFAN_BOLTZMANN * Tk**4
-
-plt.figure()
-plt.plot(forc['LWin'], '.-', alpha=0.5, label='mod')
-plt.plot(LWin_pred, '.-', alpha=0.9, label='pred')
-plt.plot(LWin, '.-', alpha=0.9, label='obs')
-plt.legend()
-
+#v = ['Tair']
+for k in range(len(v)):
+    
+    plt.figure()
+    plt.plot(t, Y[:,k], '-', label='obs-train')
+    plt.plot(t, Ytpred[:,k], '-', label='pred-train')
+    plt.plot(tp, Yp[:,k], '-', label='obs-test')
+    plt.plot(tp, Ypred[:,k], '-', label='pred-test')
+    plt.title(v[k])
+    plt.legend()
+    
+    fig, ax = plt.subplots(1,2)
+    ax[0].set_title(v[k] + ' train set')
+    
+    ax[0].plot(Y[:,k], Ytpred[:,k], '.', alpha=0.3, label='train')
+    ax[0].set_xlabel('obs')
+    ax[0].set_ylabel('pred')
+    
+    p = np.polyfit(Y[:,k], Ytpred[:,k], 1)
+    xx = np.array([min(Y[:,k]), max(Y[:,k])])
+    fit = p[1] + p[0] * xx
+    ax[0].plot(xx, fit, '-', label='%.2f' %p[0])
+    ax[0].legend()
+    
+    ax[1].set_title(v[k] + ' test set')
+    
+    ax[1].plot(Yp[:,k], Ypred[:,k], '.', alpha=0.3, label='train')
+    ax[1].set_xlabel('obs')
+    ax[1].set_ylabel('pred')
+    
+    p = np.polyfit(Yp[:,k], Ypred[:,k], 1)
+    xx = np.array([min(Y[:,k]), max(Y[:,k])])
+    fit = p[1] + p[0] * xx
+    ax[1].plot(xx, fit, '-', label='%.2f' %p[0])
+    ax[1].legend()
+    
+    
+    # plt.figure()
+    # plt.plot(t, Y[:,k], '-', label='obs-train')
+    # plt.plot(t, Ytpred[:,k], '-', label='pred-train')
+    # plt.plot(tp, Yp, '-', label='obs-test')
+    # plt.plot(tp, Ypred, '-', label='pred-test')
+    # plt.title(v)
+    # plt.legend()
+    
+    # fig, ax = plt.subplots(1,2)
+    # ax[0].set_title(v + ' train set')
+    
+    # ax[0].plot(Y, Ytpred, '.', alpha=0.3, label='train')
+    # ax[0].set_xlabel('obs')
+    # ax[0].set_ylabel('pred')
+    
+    # p = np.polyfit(Y, Ytpred, 1)
+    # xx = np.array([min(Y), max(Y)])
+    # fit = p[1] + p[0] * xx
+    # ax[0].plot(xx, fit, '-', label='%.2f' %p[0])
+    # ax[0].legend()
+    
+    # ax[1].set_title(v + ' test set')
+    
+    # ax[1].plot(Yp, Ypred, '.', alpha=0.3, label='train')
+    # ax[1].set_xlabel('obs')
+    # ax[1].set_ylabel('pred')
+    
+    # p = np.polyfit(Yp, Ypred, 1)
+    # xx = np.array([min(Y), max(Y)])
+    # fit = p[1] + p[0] * xx
+    # ax[1].plot(xx, fit, '-', label='%.2f' %p[0])
+    # ax[1].legend()

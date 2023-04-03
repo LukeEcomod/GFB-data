@@ -366,24 +366,33 @@ def rf_crossvalidate(X, Y, test_size=0.3, nfolds=5, n_estimators=10):
     #from sklearn import metrics
     #from sklearn import preprocessing
     
+    if len(Y.shape) == 1:
+        Y = Y.reshape(-1,1)
+    if len(X.shape) == 1:
+        X = X.reshape(-1,1)
+        
     X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=test_size, random_state=0)
+            
+    # preprocess
+    scaler_X = preprocessing.StandardScaler().fit(X_train)
+    scaler_Y = preprocessing.StandardScaler().fit(Y_train)
     
-    scaler = preprocessing.StandardScaler().fit(X)
-    X_transformed = scaler.transform(X)
-    X_train_transformed = scaler.transform(X_train)
-    X_test_transformed = scaler.transform(X_test)
+    X_train = scaler_X.transform(X_train)
+    X_test = scaler_X.transform(X_test)
+    
+    Y_train = scaler_Y.transform(Y_train)
+    Y_test = scaler_Y.transform(Y_test)
     
     # cross-validation
-
-    rf = RandomForestRegressor(n_estimators=n_estimators).fit(X_transformed, Y)
-    cv_score = cross_val_score(rf, X, Y, cv=nfolds)
+    rf = RandomForestRegressor(n_estimators=n_estimators).fit(X_train, Y_train)
+    cv_score = np.mean(cross_val_score(rf, X, Y, cv=nfolds))
     print('cross-validation score r2', cv_score)
     
-    rf = RandomForestRegressor(n_estimators=n_estimators).fit(X_train_transformed, Y_train)
-    score = rf.score(X_test_transformed, Y_test)
+    rf = RandomForestRegressor(n_estimators=n_estimators).fit(X_train, Y_train)
+    score = rf.score(X_test, Y_test)
     print('test score r2', score)
     
-    return rf, scaler, np.mean(cv_score), score
+    return rf, scaler_X, scaler_Y, cv_score, score
     
 
 #%% Biomet gap-filling & pyAPES forcing file
@@ -403,8 +412,18 @@ def gap_fill_rf(Y, X, ix_t, n_estimators=10, figtitle=''):
     ix_p = np.setdiff1d(t, ix_t)
 
     # fit random forest model
-    rf, scaler, cv_score, score = rf_crossvalidate(X[ix_t], Y[ix_t], test_size=0.3, nfolds=5, n_estimators=10)
-    Y_pred = rf.predict(scaler.transform(X))
+    X_train = X[ix_t]
+    Y_train = Y[ix_t]
+    
+    scaler_X = preprocessing.StandardScaler().fit(X_train)
+    X_train = scaler_X.transform(X_train)
+    
+    rf = RandomForestRegressor(n_estimators=n_estimators).fit(X_train, Y_train)
+    
+    X = scaler_X.transform(X)
+    Y_pred = rf.predict(X)
+    
+    print('score R2: ', rf.score(X[ix_t], Y[ix_t]))
     
     fig, ax = plt.subplots(2,2)
     
@@ -422,7 +441,8 @@ def gap_fill_rf(Y, X, ix_t, n_estimators=10, figtitle=''):
  
         ax.bar(x, h, width=w, align='edge', alpha=alpha, label=label)
         
-    
+        return None
+
     plothist(ax[1,0], Y[ix_t], bins=20, alpha = 0.5, density=True, label='train')
     plothist(ax[1,0], Y_pred[ix_t], bins=20, alpha = 0.5, density=True, label='RF - train')
     plothist(ax[1,0], Y_pred[ix_p], bins=20, alpha = 0.5, density=True, label='RF - pred')
@@ -694,13 +714,14 @@ def create_forcingfile(df, output_file, lat, lon, met_data=None, timezone=+0.0, 
             
             df[c].iloc[ix] = met_data[c].iloc[ix].values
             flags[c].iloc[ix] = -1
-    else:
-        df['Prec'] = df['Prec'].fillna(0.0)
+    
+    # --- set prec to 0.0 if still NaN's
+    df['Prec'] = df['Prec'].fillna(0.0)
         
     # *** solar zenith angle
-    jday = df.index.dayofyear + df.index.hour / 24.0 + df.index.minute / 1440.0 - dt / 2.0 / 86400.0
+    jday = df.index.dayofyear + df.index.hour / 24.0 + df.index.minute / 1440.0 - dt / timezone / 86400.0
 
-    df['Zen'], _, _, _, _, _ = solar_angles(lat, lon, jday, timezone=timezone)
+    df['Zen'], _, _, _, _, _ = solar_angles(lat, lon, jday, timezone=+0.0)
     cols.append('Zen')
     readme += "\nZen: Zenith angle [rad], (lat = %.2f, lon = %.2f)" % (lat, lon)
 
@@ -774,7 +795,7 @@ def create_forcingfile(df, output_file, lat, lon, met_data=None, timezone=+0.0, 
     X['doy'] = X['doy'] + X.index.hour.values / 24 + X.index.hour.values / (24 * 60)
 
     X = X.values
-    Y = f_diff.values
+    Y = f_diff.values #.reshape(-1,1)
     
     ygf, _ = gap_fill_rf(Y, X, ix_t, n_estimators=10, figtitle='d_f')
     
@@ -820,9 +841,9 @@ def create_forcingfile(df, output_file, lat, lon, met_data=None, timezone=+0.0, 
         flags['LWin'].iloc[ix_t] = 1.0
         
         # estimate clould cover and clear-sky emissivity
-        decimal_doy = df['doy'].values + df.index.hour.values / 24 + df.index.minute.values / (24*60)
+        #decimal_doy = df['doy'].values + df.index.hour.values / 24 + df.index.minute.values / (24*60)
     
-        f_cloud, _ , emi_sky = compute_clouds_rad(decimal_doy,
+        f_cloud, _ , emi_sky = compute_clouds_rad(df['doy'].values,
                                                   df['Zen'].values,
                                                   df['Rg'].values,
                                                   1e-3 * df['H2O'].values * df['P'].values,
@@ -839,9 +860,9 @@ def create_forcingfile(df, output_file, lat, lon, met_data=None, timezone=+0.0, 
     
     else:
         # estimate clould cover and clear-sky emissivity
-        decimal_doy = df['doy'].values + df.index.hour.values / 24 + df.index.minute.values / (24*60)
+        #decimal_doy = df['doy'].values + df.index.hour.values / 24 + df.index.minute.values / (24*60)
     
-        f_cloud, _ , emi_sky = compute_clouds_rad(decimal_doy,
+        f_cloud, _ , emi_sky = compute_clouds_rad(df['doy'].values,
                                                   df['Zen'].values,
                                                   df['Rg'].values,
                                                   1e-3 * df['H2O'].values * df['P'].values,
@@ -947,7 +968,7 @@ def solar_angles(lat, lon, jday, timezone=+2.0):
     computes zenith, azimuth and declination angles for given location and time
     Args:
         lat, lon (deg)
-        jday - decimal day of year (float or array)
+        jday - decimal day of year (float or array). NOTE MUST BE IN UTC!
         timezone - > 0 when east from Greenwich
     Returns:
         zen, azim, decl - rad
@@ -1010,7 +1031,7 @@ def compute_clouds_rad(doy, zen, Rg, H2O, Tair):
     Estimates atmospheric transmissivity (tau_atm [-]), cloud cover fraction
     (f_cloud (0-1), [-]) and fraction of diffuse to total SW radiation (f_diff, [-])
     Args:
-        doy - julian day
+        doy - julian day (decimal day)
         zen - sun zenith angle (rad)
         Rg - total measured Global radiation above canopy (Wm-2)
         H2O - water vapor pressure (Pa)

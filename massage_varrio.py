@@ -135,14 +135,13 @@ met = met[['Rn', 'Rg', 'Par', 'diffPar', 'U', 'u_star', 'Tair', 'RH', 'CO2', 'LW
            'Tsoil', 'Wsoil', 'Snowdepth']]
 
 met = met[~met.index.duplicated(keep='first')]
-#%%
+
 from src.utils import create_forcingfile, save_df_to_csv
 timezone = +2.0
 lat = 67.747
 lon = 29.618
 forc, flags, readme = create_forcingfile(met.copy(), 'output_file',lat, lon, met_data=fmi.copy(), timezone=timezone,
                                  CO2_constant=False, short_gap_len=5)
-
 forc.insert(0, 'Year', forc.index.year.values)
 forc.insert(1, 'Month', forc.index.month.values)
 forc.insert(2, 'Day', forc.index.day.values)
@@ -153,11 +152,12 @@ c = list(flags.columns)
 
 cc = ['flag_' + k for k in c]
 flags.columns = cc
-
+flags.index=forc.index
 forc = pd.concat([forc, flags], axis=1)
 
 readme +="\nflag_x: 0 = observed, -1 = filled by another instrument, 1 = linear interpolation, 2 > MDV (days), \n\
             -2 = Prec set to 0.0 in absence of data"
+
 
 #%%  *** save to asciii files
 
@@ -173,14 +173,14 @@ flx = pd.concat([flx, flx_sub[['F_c_sub', 'H_sub', 'LE_sub', 'u_star_sub', 'U_su
 
 # observations
 flx.to_csv(r'c:\DATA\GFB\FI-Var\Proc\FI-Var_2013_2022.dat', sep=';',
-           float_format='%.5f', na_rep='NaN', index=False)
+           float_format='%.2f', na_rep='NaN', index=False)
 
 #flx_sub.to_csv(r'c:\DATA\GFB\FI-Var\Proc\FI-Var_sub_2013_2022.dat', sep=';',
 #           float_format='%.5f', na_rep='NaN', index=False)
 
 # forcing
 forc.to_csv(r'c:\data\GFB\FI-Var\proc\FI-Var_forcing_2013-2022.dat', sep=';', 
-            na_rep='NaN', float_format='%.5f', index=False)
+            na_rep='NaN', float_format='%.2f', index=False)
 
 # forcing readme
 
